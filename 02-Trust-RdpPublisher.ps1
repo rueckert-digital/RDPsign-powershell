@@ -3,29 +3,54 @@
 Installs trust for a signed RDP file on the target/opening machine.
 
 .DESCRIPTION
-Manual user action before running:
-- Copy the signed .rdp file from Script #1 to this machine.
-- Copy the public .cer file from Script #1 to this machine.
-- Do NOT copy/import the .pfx unless this machine should also sign RDP files.
+Agent map: this is Script #2 in the workflow. Run it on the client that opens the signed .RDP file.
+Manual user action before running: copy the signed .RDP file and public .CER files from Script #1.
 
-This script:
-- Requires an existing .rdp file and .cer file.
-- Imports the .cer idempotently into Root and TrustedPublisher.
-- Adds the certificate SHA1 thumbprint to the trusted .rdp publisher policy.
-- Checks that the .rdp contains signscope:s: and signature:s:.
-- Checks that signature:s: is valid Base64 and plausible.
-- Optionally runs rdpsign /l if a matching private key exists locally.
-- Does NOT modify the .rdp file.
-- Does NOT sign the .rdp file.
+This script is trust-only:
+- imports the RDP publisher .CER into Root and TrustedPublisher
+- adds the publisher thumbprint to the trusted .RDP publisher policy
+- optionally imports the remote host TLS .CER into Root
+- validates expected host/user fields and signed-RDP structure
+- optionally runs rdpsign /l only when a matching private key exists locally
 
-.EXECUTION
-.\02-Install-RdpPublisherTrust.ps1 `
+.PARAMETER RdpPath
+Path to the signed .RDP file copied from Script #1.
+
+.PARAMETER CerPath
+Path to the public RDP publisher .CER file copied from Script #1. Do not pass .PFX here.
+
+.PARAMETER Scope
+Trust scope. LocalMachine requires elevated PowerShell. CurrentUser avoids machine-wide changes.
+
+.PARAMETER ExpectedHostName
+Optional safety check for the RDP full address:s:<value> field.
+
+.PARAMETER ExpectedUserName
+Optional safety check for the RDP username:s:<value> field. Use DOMAIN\user or \user / .\user.
+
+.PARAMETER RunRdpSignListTest
+Runs rdpsign /l only if a matching private key exists locally. Skipped is expected on trust-only clients.
+
+.PARAMETER RemoteDesktopCerPath
+Optional Remote Desktop TLS .CER from the remote host, used to trust the remote computer identity prompt.
+
+.PARAMETER SkipGpUpdate
+Skips gpupdate /force after LocalMachine policy changes.
+
+.EXAMPLE
+.\02-Trust-RdpPublisher.ps1 `
   -RdpPath "$env:USERPROFILE\Desktop\RDP SHRIMPS.rdp" `
   -CerPath "$env:USERPROFILE\Desktop\RDP SHRIMPS.cer" `
   -RemoteDesktopCerPath "$env:USERPROFILE\Desktop\RDP-TLS-SHRIMPS.cer" `
   -ExpectedHostName "SHRIMPS" `
   -ExpectedUserName "\alex" `
   -RunRdpSignListTest
+
+.OUTPUTS
+PSCustomObject with trust actions, policy state, signature structure check, and optional rdpsign /l status.
+
+.NOTES
+AI/agent safety: this script must not modify or re-sign the .RDP file. Keep it trust-only.
 #>
 
 param(
@@ -59,12 +84,14 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# ✦ Elevation guard for machine-wide certificate stores and HKLM policy.
 function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]::new($identity)
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+# ✦ Prevent RDP setting injection in expected host/user values.
 function Assert-NoControlChars {
     param(
         [Parameter(Mandatory = $true)][string]$Name,
@@ -93,6 +120,7 @@ function Get-CertSha256Hash {
     }
 }
 
+# ✦ Reads one RDP string setting while tolerating empty lines.
 function Get-RdpStringSetting {
     param(
         [Parameter(Mandatory = $true)]
@@ -124,6 +152,7 @@ function Get-RdpStringSetting {
     return $line.Substring($prefix.Length)
 }
 
+# ✦ Idempotent certificate import helper.
 function Import-CertIfMissing {
     param(
         [Parameter(Mandatory = $true)][string]$CerPath,
@@ -154,6 +183,7 @@ function Import-CertIfMissing {
     }
 }
 
+# ✦ RDP publisher trust policy: append thumbprint without removing existing entries.
 function Add-TrustedRdpPublisherThumbprint {
     param(
         [Parameter(Mandatory = $true)][string]$Thumbprint,
@@ -201,6 +231,7 @@ function Add-TrustedRdpPublisherThumbprint {
     }
 }
 
+# ✦ Lightweight signed-RDP structure check; does not parse signature as SignedCms.
 function Test-RdpSignedStructure {
     param(
         [Parameter(Mandatory = $true)]
@@ -211,13 +242,13 @@ function Test-RdpSignedStructure {
 
     $signatureLines = @(
         $lines | Where-Object {
-            $_.StartsWith("signature:s:", [System.StringComparison]::OrdinalIgnoreCase)
+            $_ -and $_.StartsWith("signature:s:", [System.StringComparison]::OrdinalIgnoreCase)
         }
     )
 
     $signScopeLines = @(
         $lines | Where-Object {
-            $_.StartsWith("signscope:s:", [System.StringComparison]::OrdinalIgnoreCase)
+            $_ -and $_.StartsWith("signscope:s:", [System.StringComparison]::OrdinalIgnoreCase)
         }
     )
 
@@ -302,6 +333,7 @@ function Find-LocalCertWithPrivateKey {
     return $null
 }
 
+# ✦ Optional signability smoke test; skipped on normal trust-only clients.
 function Invoke-RdpSignListTestIfPossible {
     param(
         [Parameter(Mandatory = $true)]$CerCertificate,
@@ -354,6 +386,7 @@ function Invoke-RdpSignListTestIfPossible {
     }
 }
 
+# ✦ Trust remote computer identity certificate to suppress RDP TLS identity warning.
 function Install-RemoteDesktopServerCertificateTrust {
     param(
         [Parameter(Mandatory = $true)]
@@ -395,6 +428,7 @@ function Install-RemoteDesktopServerCertificateTrust {
     }
 }
 
+# ✦ Phase 1: validate files, elevation, and expected RDP identity values.
 if (-not (Test-Path -LiteralPath $RdpPath)) {
     throw "RDP file not found: $RdpPath"
 }
@@ -451,6 +485,7 @@ $publisherStore = if ($Scope -eq "LocalMachine") {
     "Cert:\CurrentUser\TrustedPublisher"
 }
 
+# ✦ Phase 2: optional remote TLS trust, then publisher signature/trust installation.
 $remoteDesktopTrust = $null
 
 if ($RemoteDesktopCerPath) {
@@ -479,6 +514,7 @@ if (-not $SkipGpUpdate -and $Scope -eq "LocalMachine") {
     gpupdate /force | Out-Null
 }
 
+# ✦ Phase 3: optional rdpsign /l smoke test and final state report.
 $rdpSignListTest = if ($RunRdpSignListTest) {
     Invoke-RdpSignListTestIfPossible -CerCertificate $cerCert -RdpPath $RdpPath
 } else {
