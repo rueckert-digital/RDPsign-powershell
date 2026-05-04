@@ -1,38 +1,75 @@
 #requires -RunAsAdministrator
 <#
 .SYNOPSIS
-Idempotently creates/reuses an exportable Code Signing certificate, exports CER + PFX,
-copies an existing input RDP file to an output RDP file, updates host/user,
-removes any old signature, signs the output RDP file, and verifies the signature.
+Creates/reuses an RDP file publisher signing certificate, exports artifacts, signs an RDP file, and exports the remote TLS certificate.
 
 .DESCRIPTION
-Run this on the signing machine.
+Agent map: this is Script #1 in the workflow. Run it on the signing/remote machine.
+It never creates the input RDP template. It copies an existing DEFAULT.RDP-style file,
+normalizes host/user fields, removes stale RDP signature fields, signs the output file,
+and performs a lightweight signature-structure check.
 
-Default behavior:
-- Input RDP:  %USERPROFILE%\Desktop\DEFAULT.RDP
-- Output RDP: %USERPROFILE%\Desktop\RDP <HostName>.RDP
-- FriendlyName: RDP <HostName>
-- CER/PFX/state files are written next to the output artifacts.
+Outputs are intentionally split:
+- signed .RDP file: copy to the target/opening machine
+- .CER publisher certificate: copy to the target/opening machine for trust
+- .PFX publisher certificate: private-key backup/transport only; do not install on trust-only clients
+- RDP-TLS-<computer>.cer: optional remote computer TLS trust certificate
 
-Important:
-- The input RDP file must already exist.
-- This script never creates a new RDP file from scratch.
-- The output RDP file is overwritten every run.
-- The output RDP file is freshly signed every run.
-- Script #2 should install/trust the .cer on the opening/remote client.
+.PARAMETER HostName
+Remote computer name or IP written into full address:s:<value>.
 
-.EXECUTION
+.PARAMETER UserName
+Username written into username:s:<value>. Use DOMAIN\user for domain users or \user / .\user for local users.
 
+.PARAMETER FriendlyName
+Certificate friendly name and default artifact name prefix. Default: RDP <HostName>.
+
+.PARAMETER InputRdpPath
+Existing RDP template path. Default: %USERPROFILE%\Desktop\DEFAULT.RDP. Must already exist.
+
+.PARAMETER OutputDirectory
+Default output folder for RDP/CER/PFX/state artifacts.
+
+.PARAMETER OutputRdpPath
+Signed output RDP path. Default: <OutputDirectory>\RDP <HostName>.RDP.
+
+.PARAMETER CerPath
+Public publisher certificate export path.
+
+.PARAMETER PfxPath
+Publisher certificate + private key export path. Sensitive.
+
+.PARAMETER StatePath
+Stores the selected signing certificate thumbprint for idempotent reuse.
+
+.PARAMETER PfxPassword
+SecureString password for .PFX export. Prompted if omitted.
+
+.PARAMETER ValidYears
+Validity period for newly created signing certificates.
+
+.PARAMETER MinRemainingDays
+Minimum remaining validity required before an existing certificate is reused.
+
+.PARAMETER ForceNewCert
+Forces creation of a new exportable Code Signing certificate.
+
+.EXAMPLE
 .\01-NewAndSign-Rdp.ps1 -HostName "HOST_OR_IP"
 
-Further Parameters:
+.EXAMPLE
+.\01-NewAndSign-Rdp.ps1 `
+  -HostName "SHRIMPS" `
+  -UserName "\alex" `
+  -InputRdpPath "$env:USERPROFILE\Desktop\DEFAULT.RDP" `
+  -OutputRdpPath "$env:USERPROFILE\Desktop\RDP SHRIMPS.RDP"
 
- -UserName "DOMAIN\user"
- -UserName "\user"
- -InputRdpPath "$env:USERPROFILE\Desktop\DEFAULT.RDP"
- -OutputRdpPath "$env:USERPROFILE\Desktop\RDP SHRIMPS.RDP"
- -FriendlyName "RDP SHRIMPS"
+.OUTPUTS
+PSCustomObject with artifact paths, selected certificate thumbprints, and signature check status.
 
+.NOTES
+AI/agent safety: keep the execution phases in order: validate -> select cert -> export -> rebuild RDP -> sign -> verify -> export TLS cert.
+Any RDP content change after signing invalidates the signature.
 #>
 
 param(
@@ -80,6 +117,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# * Guardrail: prevent RDP setting injection via newline characters.
 function Assert-NoControlChars {
     param(
         [Parameter(Mandatory = $true)][string]$Name,
@@ -91,6 +129,7 @@ function Assert-NoControlChars {
     }
 }
 
+# * Artifact naming: keep generated filenames Windows-safe.
 function ConvertTo-SafeFileName {
     param([Parameter(Mandatory = $true)][string]$Value)
 
@@ -102,11 +141,13 @@ function ConvertTo-SafeFileName {
     return (-join $chars).Trim()
 }
 
+# * Thumbprints are compared without spaces and in invariant uppercase.
 function Get-CleanThumbprint {
     param([Parameter(Mandatory = $true)][string]$Thumbprint)
     return ($Thumbprint -replace "\s", "").ToUpperInvariant()
 }
 
+# * Some rdpsign builds accept SHA1 store thumbprints; this also computes SHA256 cert hash fallback.
 function Get-CertSha256Hash {
     param([Parameter(Mandatory = $true)]$Certificate)
 
@@ -119,24 +160,21 @@ function Get-CertSha256Hash {
     }
 }
 
+# * Certificate selector: Code Signing EKU = 1.3.6.1.5.5.7.3.3.
 function Test-CodeSigningEku {
     param([Parameter(Mandatory = $true)]$Certificate)
 
     $codeSigningOid = "1.3.6.1.5.5.7.3.3"
-
     $ekuOids = @(
         $Certificate.EnhancedKeyUsageList | ForEach-Object {
-            if ($_.ObjectId.Value) {
-                $_.ObjectId.Value
-            } else {
-                [string]$_.ObjectId
-            }
+            if ($_.ObjectId.Value) { $_.ObjectId.Value } else { [string]$_.ObjectId }
         }
     )
 
     return ($ekuOids -contains $codeSigningOid)
 }
 
+# * Idempotency predicate: a reusable signing cert must match identity, EKU, key, and lifetime.
 function Test-RdpSigningCert {
     param(
         [Parameter(Mandatory = $true)]$Certificate,
@@ -165,6 +203,7 @@ function Get-CertByThumbprint {
         Select-Object -First 1
 }
 
+# * Prefer state-file thumbprint, then fall back to matching LocalMachine\My cert.
 function Get-ExistingRdpSigningCert {
     param(
         [Parameter(Mandatory = $true)][string]$Subject,
@@ -191,6 +230,7 @@ function Get-ExistingRdpSigningCert {
         Select-Object -First 1
 }
 
+# * Creates exportable key because .PFX backup/transport is a required artifact.
 function New-RdpSigningCert {
     param(
         [Parameter(Mandatory = $true)][string]$Subject,
@@ -211,6 +251,7 @@ function New-RdpSigningCert {
         -NotAfter (Get-Date).AddYears($ValidYears)
 }
 
+# * Public .CER is for clients; .PFX is sensitive private-key material.
 function Export-RdpSigningArtifacts {
     param(
         [Parameter(Mandatory = $true)]$Certificate,
@@ -231,9 +272,14 @@ function Export-RdpSigningArtifacts {
         -Force | Out-Null
 }
 
+# * RDP mutator: replace duplicate string settings with one canonical line.
 function Set-RdpStringSetting {
     param(
-        [Parameter(Mandatory = $true)][string[]]$Lines,
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [AllowEmptyString()]
+        [string[]]$Lines,
+
         [Parameter(Mandatory = $true)][string]$Name,
         [Parameter(Mandatory = $true)][string]$Value,
         [Parameter(Mandatory = $false)][switch]$OnlyIfExists
@@ -245,7 +291,7 @@ function Set-RdpStringSetting {
     $result = New-Object System.Collections.Generic.List[string]
 
     foreach ($line in $Lines) {
-        if ($line.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        if ($line -and $line.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
             if (-not $found) {
                 $result.Add($newLine)
                 $found = $true
@@ -262,15 +308,18 @@ function Set-RdpStringSetting {
     return $result.ToArray()
 }
 
+# * Old signature fields must be removed before rewriting and signing.
 function Remove-RdpSignatureFromLines {
     param(
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [AllowEmptyString()]
         [string[]]$Lines
     )
 
     return @(
         $Lines | Where-Object {
-            $_ -notmatch "^(signature|signscope):s:"
+            -not ($_ -and ($_ -match "^(signature|signscope):s:"))
         }
     )
 }
@@ -295,6 +344,7 @@ function Remove-RdpSignature {
     )
 }
 
+# * Build output from an existing template only; never invent DEFAULT.RDP.
 function Update-RdpFileFromExistingInput {
     param(
         [Parameter(Mandatory = $true)][string]$InputRdpPath,
@@ -313,14 +363,9 @@ function Update-RdpFileFromExistingInput {
     }
 
     $lines = [System.IO.File]::ReadAllLines($InputRdpPath)
-
-    # Any change invalidates old signatures. Remove before writing/signing output.
     $lines = Remove-RdpSignatureFromLines -Lines $lines
-
     $lines = Set-RdpStringSetting -Lines $lines -Name "full address" -Value $HostName
     $lines = Set-RdpStringSetting -Lines $lines -Name "username" -Value $UserName
-
-    # If present, sync this too to avoid stale target data.
     $lines = Set-RdpStringSetting -Lines $lines -Name "alternate full address" -Value $HostName -OnlyIfExists
 
     [System.IO.File]::WriteAllLines(
@@ -345,6 +390,7 @@ function Get-RdpSignPath {
     return "rdpsign.exe"
 }
 
+# * Sign with rdpsign.exe; try SHA1 then SHA256 certificate hash for build compatibility.
 function Invoke-RdpSign {
     param(
         [Parameter(Mandatory = $true)]$Certificate,
@@ -356,12 +402,8 @@ function Invoke-RdpSign {
     }
 
     $rdpSignPath = Get-RdpSignPath
-
     $sha1Thumb = Get-CleanThumbprint $Certificate.Thumbprint
     $sha256Thumb = Get-CertSha256Hash -Certificate $Certificate
-
-    # Try SHA1 store thumbprint first, then SHA256 cert hash.
-    # The verification below proves the actual signer.
     $candidates = @($sha1Thumb, $sha256Thumb) | Select-Object -Unique
     $errors = New-Object System.Collections.Generic.List[string]
 
@@ -383,6 +425,7 @@ function Invoke-RdpSign {
     throw "rdpsign.exe failed for all thumbprint candidates. $($errors -join ' | ')"
 }
 
+# * Lightweight check: RDP signatures are not parsed as SignedCms here.
 function Test-RdpSignature {
     param(
         [Parameter(Mandatory = $true)]
@@ -397,18 +440,8 @@ function Test-RdpSignature {
     }
 
     $lines = Get-Content -LiteralPath $RdpPath
-
-    $signatureLines = @(
-        $lines | Where-Object {
-            $_.StartsWith("signature:s:", [System.StringComparison]::OrdinalIgnoreCase)
-        }
-    )
-
-    $signScopeLines = @(
-        $lines | Where-Object {
-            $_.StartsWith("signscope:s:", [System.StringComparison]::OrdinalIgnoreCase)
-        }
-    )
+    $signatureLines = @($lines | Where-Object { $_ -and $_.StartsWith("signature:s:", [System.StringComparison]::OrdinalIgnoreCase) })
+    $signScopeLines = @($lines | Where-Object { $_ -and $_.StartsWith("signscope:s:", [System.StringComparison]::OrdinalIgnoreCase) })
 
     if ($signatureLines.Count -ne 1) {
         throw "Expected exactly one signature:s: line, found $($signatureLines.Count)."
@@ -424,8 +457,6 @@ function Test-RdpSignature {
         throw "signature:s: line exists, but signature value is empty."
     }
 
-    # Remove whitespace defensively. Console wrapping is visual, but this also protects
-    # against accidental copied line breaks or formatting damage.
     $signatureValueClean = [regex]::Replace($signatureValue, "\s+", "")
 
     try {
@@ -446,10 +477,47 @@ function Test-RdpSignature {
         ExpectedCertSubject    = $ExpectedCertificate.Subject
         ExpectedThumbprint     = Get-CleanThumbprint $ExpectedCertificate.Thumbprint
         ChainTrustCheckedHere  = $false
-        ChainTrustReason       = "RDP signature is not validated as SignedCms here. Script #2 installs Root/TrustedPublisher/RDP publisher trust on the opening client."
+        ChainTrustReason       = "Script #2 installs Root/TrustedPublisher/RDP publisher trust on the opening client."
     }
 }
 
+# * Optional helper artifact: export the actual RDP listener TLS certificate for Script #2.
+function Export-RemoteDesktopTlsCertificate {
+    param(
+        [Parameter(Mandatory = $true)][string]$OutPath
+    )
+
+    $listener = Get-CimInstance `
+        -Namespace "root\cimv2\terminalservices" `
+        -ClassName "Win32_TSGeneralSetting" `
+        -Filter "TerminalName='RDP-tcp'"
+
+    $rdpTlsThumb = ($listener.SSLCertificateSHA1Hash -replace "\s", "").ToUpperInvariant()
+
+    $rdpTlsCert = @(
+        Get-ChildItem "Cert:\LocalMachine\Remote Desktop" -ErrorAction SilentlyContinue
+        Get-ChildItem "Cert:\LocalMachine\My" -ErrorAction SilentlyContinue
+    ) | Where-Object {
+        ($_.Thumbprint -replace "\s", "").ToUpperInvariant() -eq $rdpTlsThumb
+    } | Select-Object -First 1
+
+    if (-not $rdpTlsCert) {
+        throw "RDP TLS certificate not found. Listener thumbprint: $rdpTlsThumb"
+    }
+
+    Export-Certificate -Cert $rdpTlsCert -FilePath $OutPath -Force | Out-Null
+
+    return [pscustomobject]@{
+        Path        = $OutPath
+        Subject     = $rdpTlsCert.Subject
+        Issuer      = $rdpTlsCert.Issuer
+        Thumbprint  = Get-CleanThumbprint $rdpTlsCert.Thumbprint
+        NotBefore   = $rdpTlsCert.NotBefore
+        NotAfter    = $rdpTlsCert.NotAfter
+    }
+}
+
+# * Phase 1: validate inputs and derive artifact paths.
 Assert-NoControlChars -Name "HostName" -Value $HostName
 Assert-NoControlChars -Name "UserName" -Value $UserName
 
@@ -489,29 +557,31 @@ if (-not $PfxPassword) {
     $PfxPassword = Read-Host "PFX password" -AsSecureString
 }
 
+# * Phase 2: create or reuse the RDP publisher signing certificate.
 $subject = "CN=$FriendlyName"
-$cert = $null
+$signingCert = $null
 $createdNewCert = $false
 
 if (-not $ForceNewCert) {
-    $cert = Get-ExistingRdpSigningCert `
+    $signingCert = Get-ExistingRdpSigningCert `
         -Subject $subject `
         -FriendlyName $FriendlyName `
         -StatePath $StatePath `
         -MinRemainingDays $MinRemainingDays
 }
 
-if (-not $cert) {
+if (-not $signingCert) {
     Write-Host "Creating exportable Code Signing certificate: $subject" -ForegroundColor Yellow
-    $cert = New-RdpSigningCert -Subject $subject -FriendlyName $FriendlyName -ValidYears $ValidYears
+    $signingCert = New-RdpSigningCert -Subject $subject -FriendlyName $FriendlyName -ValidYears $ValidYears
     $createdNewCert = $true
 } else {
-    Write-Host "Reusing certificate: $($cert.Thumbprint)" -ForegroundColor Green
+    Write-Host "Reusing certificate: $($signingCert.Thumbprint)" -ForegroundColor Green
 }
 
+# * Phase 3: export publisher trust artifacts.
 try {
     Export-RdpSigningArtifacts `
-        -Certificate $cert `
+        -Certificate $signingCert `
         -CerPath $CerPath `
         -PfxPath $PfxPath `
         -PfxPassword $PfxPassword
@@ -519,11 +589,11 @@ try {
     if (-not $createdNewCert -and -not $ForceNewCert) {
         Write-Warning "Existing certificate could not be exported as PFX. Creating a new exportable certificate."
 
-        $cert = New-RdpSigningCert -Subject $subject -FriendlyName $FriendlyName -ValidYears $ValidYears
+        $signingCert = New-RdpSigningCert -Subject $subject -FriendlyName $FriendlyName -ValidYears $ValidYears
         $createdNewCert = $true
 
         Export-RdpSigningArtifacts `
-            -Certificate $cert `
+            -Certificate $signingCert `
             -CerPath $CerPath `
             -PfxPath $PfxPath `
             -PfxPassword $PfxPassword
@@ -532,69 +602,51 @@ try {
     }
 }
 
-$thumb = Get-CleanThumbprint $cert.Thumbprint
-Set-Content -LiteralPath $StatePath -Value $thumb -Encoding ASCII
+$signingThumb = Get-CleanThumbprint $signingCert.Thumbprint
+Set-Content -LiteralPath $StatePath -Value $signingThumb -Encoding ASCII
 
-# Always rebuild output RDP from the existing input RDP.
+# * Phase 4: rebuild output RDP, force fresh signature, then verify signature structure.
 Update-RdpFileFromExistingInput `
     -InputRdpPath $InputRdpPath `
     -OutputRdpPath $OutputRdpPath `
     -HostName $HostName `
     -UserName $UserName
 
-# Force fresh signing on every run.
 Remove-RdpSignature -RdpPath $OutputRdpPath
 
-$signResult = Invoke-RdpSign -Certificate $cert -RdpPath $OutputRdpPath
-$verifyResult = Test-RdpSignature -RdpPath $OutputRdpPath -ExpectedCertificate $cert
+$signResult = Invoke-RdpSign -Certificate $signingCert -RdpPath $OutputRdpPath
+$verifyResult = Test-RdpSignature -RdpPath $OutputRdpPath -ExpectedCertificate $signingCert
 
-$OutPath = "$env:USERPROFILE\Desktop\RDP-TLS-$env:COMPUTERNAME.cer"
+# * Phase 5: export remote computer TLS certificate for optional identity trust.
+$remoteDesktopTlsPath = "$env:USERPROFILE\Desktop\RDP-TLS-$env:COMPUTERNAME.cer"
+$remoteDesktopTls = Export-RemoteDesktopTlsCertificate -OutPath $remoteDesktopTlsPath
 
-$listener = Get-CimInstance `
-  -Namespace "root\cimv2\terminalservices" `
-  -ClassName "Win32_TSGeneralSetting" `
-  -Filter "TerminalName='RDP-tcp'"
-
-$thumb = ($listener.SSLCertificateSHA1Hash -replace "\s","").ToUpperInvariant()
-
-$cert = @(
-  Get-ChildItem "Cert:\LocalMachine\Remote Desktop" -ErrorAction SilentlyContinue
-  Get-ChildItem "Cert:\LocalMachine\My" -ErrorAction SilentlyContinue
-) | Where-Object {
-  ($_.Thumbprint -replace "\s","").ToUpperInvariant() -eq $thumb
-} | Select-Object -First 1
-
-if (-not $cert) {
-  throw "RDP TLS certificate not found. Listener thumbprint: $thumb"
-}
-
-Export-Certificate -Cert $cert -FilePath $OutPath -Force | Out-Null
-
-$cert | Format-List Subject, Issuer, Thumbprint, NotBefore, NotAfter
-Write-Host "Exported: $OutPath"
-
+Write-Host "Exported: $($remoteDesktopTls.Path)"
 Write-Host ""
 Write-Host "Script #1 completed successfully." -ForegroundColor Green
 Write-Host ""
 
 [pscustomobject]@{
-    HostName             = $HostName
-    UserName             = $UserName
-    FriendlyName         = $FriendlyName
-    Subject              = $cert.Subject
-    SHA1Thumbprint       = $thumb
-    SHA256CertHash       = Get-CertSha256Hash -Certificate $cert
-    CreatedNewCert       = $createdNewCert
-    CertStore            = "Cert:\LocalMachine\My"
-    InputRdpPath         = $InputRdpPath
-    OutputRdpPath        = $OutputRdpPath
-    CerPath              = $CerPath
-    PfxPath              = $PfxPath
-    StatePath            = $StatePath
-    RdpSignThumbUsed     = $signResult.ThumbprintUsed
-    SignatureCheck       = $verifyResult.SignatureBase64Check
-    SignaturePayloadBytes = $verifyResult.SignaturePayloadBytes
-    SignerThumbprint     = $verifyResult.ExpectedThumbprint
-    ChainTrustChecked    = $verifyResult.ChainTrustCheckedHere
-    Idempotence          = "Reuses state thumbprint or matching cert; overwrites CER/PFX/output RDP; never creates input RDP; removes old signature; freshly signs and verifies every run."
+    HostName                    = $HostName
+    UserName                    = $UserName
+    FriendlyName                = $FriendlyName
+    Subject                     = $signingCert.Subject
+    SHA1Thumbprint              = $signingThumb
+    SHA256CertHash              = Get-CertSha256Hash -Certificate $signingCert
+    CreatedNewCert              = $createdNewCert
+    CertStore                   = "Cert:\LocalMachine\My"
+    InputRdpPath                = $InputRdpPath
+    OutputRdpPath               = $OutputRdpPath
+    CerPath                     = $CerPath
+    PfxPath                     = $PfxPath
+    StatePath                   = $StatePath
+    RdpSignThumbUsed            = $signResult.ThumbprintUsed
+    SignatureCheck              = $verifyResult.SignatureBase64Check
+    SignaturePayloadBytes       = $verifyResult.SignaturePayloadBytes
+    SignerThumbprint            = $verifyResult.ExpectedThumbprint
+    RemoteDesktopTlsCertPath    = $remoteDesktopTls.Path
+    RemoteDesktopTlsSubject     = $remoteDesktopTls.Subject
+    RemoteDesktopTlsThumbprint  = $remoteDesktopTls.Thumbprint
+    ChainTrustChecked           = $verifyResult.ChainTrustCheckedHere
+    Idempotence                 = "Reuses state thumbprint or matching cert; overwrites CER/PFX/output RDP; never creates input RDP; removes old signature; freshly signs and verifies every run."
 } | Format-List
