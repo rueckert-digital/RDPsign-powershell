@@ -10,10 +10,12 @@
 
 1. 🧩 Create `DEFAULT.RDP` from the Remote Desktop UI:
 
-   ![Create DEFAULT.RDP in Remote Desktop Connection](docs/default-rdp-save.svg)
+   ![Create DEFAULT.RDP in Remote Desktop Connection](docs/RDP-UI.png)
 
    ```text
-   mstsc.exe → Show Options → enter Computer + User name → Save As… → Desktop\DEFAULT.RDP
+   mstsc.exe → Show Options → enter Computer + User name 
+             → Show Options → Local Resources (Activate all resources you want to use)
+             → Save As… → Desktop\DEFAULT.RDP
    ```
 
 2. ✍️ On the signing machine, create/export certs + sign the output RDP:
