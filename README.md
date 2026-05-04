@@ -16,33 +16,33 @@
 2. ✍️ On the signing machine, create/export certs + sign the output RDP:
    ```powershell
    .\01-NewAndSign-Rdp.ps1 `
-     -HostName "SHRIMPS" `
-     -UserName "\\alex" `
+     -HostName "HOST_OR_IP" `
+     -UserName "DOMAIN\user" `
      -InputRdpPath "$env:USERPROFILE\Desktop\DEFAULT.RDP" `
-     -OutputRdpPath "$env:USERPROFILE\Desktop\RDP SHRIMPS.RDP"
+     -OutputRdpPath "$env:USERPROFILE\Desktop\RDP HOST_OR_IP.RDP"
    ```
 
 3. 📦 Copy to the target/opening machine:
    ```text
-   RDP SHRIMPS.RDP
-   RDP SHRIMPS.cer
-   RDP-TLS-SHRIMPS.cer   # optional, for remote computer identity trust
+   RDP HOST_OR_IP.RDP
+   RDP HOST_OR_IP.cer
+   RDP-TLS-HOST_OR_IP.cer   # optional, for remote computer identity trust
    ```
 
 4. 🛡️ On the target/opening machine, install trust:
    ```powershell
    .\02-Trust-RdpPublisher.ps1 `
-     -RdpPath "$env:USERPROFILE\Desktop\RDP SHRIMPS.RDP" `
-     -CerPath "$env:USERPROFILE\Desktop\RDP SHRIMPS.cer" `
-     -RemoteDesktopCerPath "$env:USERPROFILE\Desktop\RDP-TLS-SHRIMPS.cer" `
-     -ExpectedHostName "SHRIMPS" `
-     -ExpectedUserName "\\alex" `
+     -RdpPath "$env:USERPROFILE\Desktop\RDP HOST_OR_IP.RDP" `
+     -CerPath "$env:USERPROFILE\Desktop\RDP HOST_OR_IP.cer" `
+     -RemoteDesktopCerPath "$env:USERPROFILE\Desktop\RDP-TLS-HOST_OR_IP.cer" `
+     -ExpectedHostName "HOST_OR_IP" `
+     -ExpectedUserName "DOMAIN\user" `
      -RunRdpSignListTest
    ```
 
 5. 🚀 Start the signed connection:
    ```powershell
-   mstsc.exe "$env:USERPROFILE\Desktop\RDP SHRIMPS.RDP"
+   mstsc.exe "$env:USERPROFILE\Desktop\RDP HOST_OR_IP.RDP"
    ```
 
 ---
