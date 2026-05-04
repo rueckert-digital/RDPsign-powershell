@@ -2,15 +2,18 @@
 
 > ✨ Compact PowerShell workflow to create **trusted, signed `.rdp` files** for Windows Remote Desktop.
 
-`RDPsign-powershell` helps you remove the noisy **“Unknown publisher”** warning by signing `.rdp` files with `rdpsign.exe` and installing the required trust on the target/opening machine. It can also trust the Remote Desktop TLS certificate to avoid the **“identity of the remote computer cannot be verified”** prompt.
+`RDPsign-powershell` removes the noisy **“Unknown publisher”** prompt by signing `.rdp` files with `rdpsign.exe` and installing the required publisher trust on the target/opening machine. It can also trust the Remote Desktop TLS certificate to avoid the **“identity of the remote computer cannot be verified”** warning.
 
 ---
 
 ## ⚡ How to start
 
-1. 🧩 Prepare a base file:
-   ```powershell
-   %USERPROFILE%\Desktop\DEFAULT.RDP
+1. 🧩 Create `DEFAULT.RDP` from the Remote Desktop UI:
+
+   ![Create DEFAULT.RDP in Remote Desktop Connection](docs/default-rdp-save.svg)
+
+   ```text
+   mstsc.exe → Show Options → enter Computer + User name → Save As… → Desktop\DEFAULT.RDP
    ```
 
 2. ✍️ On the signing machine, create/export certs + sign the output RDP:
@@ -67,6 +70,17 @@ Use the **same username value** in Script #1 and Script #2.
 |---|---|
 | `01-NewAndSign-Rdp.ps1` | Creates/reuses signing cert, exports `.cer`/`.pfx`, builds output `.rdp`, signs it, verifies signature structure |
 | `02-Trust-RdpPublisher.ps1` | Imports publisher cert, adds RDP publisher trust, optionally trusts the remote host TLS cert |
+
+---
+
+## 🧾 Script docs
+
+Both scripts use PowerShell **comment-based help** (`.SYNOPSIS`, `.DESCRIPTION`, `.PARAMETER`, `.EXAMPLE`, `.OUTPUTS`, `.NOTES`) plus compact phase comments (`# ✦ ...`) so humans and AI agents can quickly infer intent, side effects, and safe execution order.
+
+```powershell
+Get-Help .\01-NewAndSign-Rdp.ps1 -Detailed
+Get-Help .\02-Trust-RdpPublisher.ps1 -Detailed
+```
 
 ---
 
