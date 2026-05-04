@@ -47,6 +47,20 @@
 
 ---
 
+## 👤 Username format
+
+Use the **same username value** in Script #1 and Script #2.
+
+| Login type | Format | Example |
+|---|---|---|
+| 🌐 Domain / AD user | `DOMAIN\user` | `ACME\alex` |
+| 🖥️ Local user on remote host | `\user` | `\alex` |
+| 🧩 Explicit local style | `.\user` | `.\alex` |
+
+> ℹ️ In PowerShell strings, `\` is just a normal backslash. No escaping required.
+
+---
+
 ## 🧠 What it does
 
 | Script | Purpose |
