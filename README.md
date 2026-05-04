@@ -27,7 +27,7 @@
      -OutputRdpPath "$env:USERPROFILE\Desktop\RDP HOST_OR_IP.RDP"
    ```
 
-3. 📦 Copy to the target/opening machine:
+3. 📦 Copy the following files to the Desktop of target/opening machine:
    ```text
    RDP HOST_OR_IP.RDP
    RDP HOST_OR_IP.cer
